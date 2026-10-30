@@ -50,48 +50,60 @@
     const seen = new Uint8Array(N);
     return PASSES.map((st) => { const l = []; for (let i = 0; i < N; i += st) if (!seen[i]) { seen[i] = 1; l.push(i); } return l; });
   };
-  const fetchBytes = async (url, onProgress) => {
+  /* reads a pack as it downloads and hands over each frame the moment its last byte arrives, so the
+     first frame shows after ~150 KB rather than after the whole pack (matters on slow connections) */
+  const streamPack = async (url, onFrameBlob, onProgress) => {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`${url}: ${res.status}`);
-    const total = +res.headers.get('content-length') || 0;
-    if (!res.body) { const b = await res.arrayBuffer(); if (onProgress) onProgress(1); return b; }
-    const reader = res.body.getReader(), chunks = [];
-    let got = 0;
+    const total = +res.headers.get('content-length') || 0; // GitHub Pages gzips .bin, so this is approximate
+    let buf = new Uint8Array(0), got = 0, k = 0;
+    const take = () => {
+      while (buf.length >= 8) {
+        const size = (buf[4] | (buf[5] << 8) | (buf[6] << 16) | (buf[7] << 24)) >>> 0, end = 8 + size + (size & 1);
+        if (buf.length < end) break;
+        onFrameBlob(k++, new Blob([buf.subarray(0, end)], { type: 'image/webp' }));
+        buf = buf.subarray(end);
+      }
+    };
+    if (!res.body) { buf = new Uint8Array(await res.arrayBuffer()); take(); if (onProgress) onProgress(1); return; }
+    const reader = res.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      chunks.push(value); got += value.length;
+      got += value.length;
+      const next = new Uint8Array(buf.length + value.length); // the tail is always under one frame
+      next.set(buf); next.set(value, buf.length); buf = next;
+      take();
       if (onProgress && total) onProgress(Math.min(1, got / total));
     }
-    const out = new Uint8Array(got);
-    let o = 0;
-    for (const c of chunks) { out.set(c, o); o += c.length; }
     if (onProgress) onProgress(1);
-    return out.buffer;
-  };
-  const splitPack = (buf) => {
-    const dv = new DataView(buf), out = [];
-    for (let o = 0; o + 8 <= buf.byteLength;) {
-      const size = dv.getUint32(o + 4, true), end = o + 8 + size + (size & 1);
-      out.push(new Blob([buf.slice(o, end)], { type: 'image/webp' }));
-      o = end;
-    }
-    return out;
   };
   /* streams `${prefix}-1.bin` … `-4.bin`; onFrame(i, img) as each frame decodes, onProgress(pack, 0..1) */
   const loadSequence = async (prefix, N, onFrame, onProgress) => {
     const passes = passFrames(N);
     for (let p = 0; p < passes.length; p++) {
-      let buf;
-      try { buf = await fetchBytes(`${prefix}-${p + 1}.bin`, (f) => onProgress && onProgress(p, f)); }
-      catch (_) { if (onProgress) onProgress(p, 1); continue; }
-      await Promise.all(splitPack(buf).map((blob, k) => {
-        const im = new Image();
-        im.src = URL.createObjectURL(blob);
-        return im.decode().then(() => onFrame(passes[p][k], im), () => {});
-      }));
+      const decodes = [];
+      let have = 0;
+      /* mobile connections drop mid-download: retry the pack, skipping frames already received */
+      for (let attempt = 0; attempt < 3 && have < passes[p].length; attempt++) {
+        try {
+          await streamPack(`${prefix}-${p + 1}.bin`, (k, blob) => {
+            if (k < have) return;
+            have = k + 1;
+            const im = new Image();
+            im.src = URL.createObjectURL(blob);
+            decodes.push(im.decode().then(() => onFrame(passes[p][k], im), () => {}));
+          }, (f) => onProgress && onProgress(p, f));
+        } catch (_) { /* fall through to the next attempt */ }
+      }
+      if (onProgress) onProgress(p, 1);
+      await Promise.all(decodes);
     }
   };
+  /* connections the browser reports as slow (or with data-saver on) get the lighter frame sets */
+  const conn = navigator.connection || {};
+  const slowNet = !!(conn.saveData || (conn.downlink && conn.downlink < 5) || /2g|3g/.test(conn.effectiveType || ''));
+  const bigScreen = () => !slowNet && innerWidth * Math.min(devicePixelRatio || 1, 2) >= 1700;
 
   $('#yr').textContent = new Date().getFullYear();
   const mq = $('#marquee');
@@ -291,6 +303,15 @@
   /* ---------- application form → prefilled email ---------- */
   const TO = 'admissions@himalayanmaritime.com';
   const form = $('#applyForm'), formBody = $('.form__body', form);
+  /* sticky on desktop: pin under the header, or — if the form is taller than the window — by its
+     bottom edge, so the Send button never ends up below the fold while it's stuck */
+  const stickForm = () => {
+    const gap = 24, top = Math.min(hdr.offsetHeight + gap, innerHeight - form.offsetHeight - gap);
+    form.style.setProperty('--form-top', `${Math.round(top)}px`);
+  };
+  stickForm();
+  addEventListener('resize', debounce(stickForm, 120));
+  if ('ResizeObserver' in window) new ResizeObserver(stickForm).observe(form); // e.g. shortlisted courses added
   const fields = { name: $('#fName'), email: $('#fEmail'), phone: $('#fPhone') };
   const valid = {
     name: (v) => v.trim().length >= 2,
@@ -440,7 +461,7 @@
   const FR = 120;
   const mobileSet = matchMedia('(max-width: 767px) and (orientation: portrait)').matches;
   /* big screens get the 1920px cut, laptops 1280px, phones a portrait crop */
-  const set = mobileSet ? 'm' : innerWidth * Math.min(devicePixelRatio || 1, 2) >= 1700 ? 'x' : 'd';
+  const set = mobileSet ? 'm' : bigScreen() ? 'x' : 'd';
   const imgs = new Array(FR), ok = new Uint8Array(FR);
   /* the loader waits for packs 1–2 (every 4th frame) — enough to scrub smoothly while the rest stream in */
   const packFrac = [0, 0];
@@ -756,7 +777,7 @@
   /* background water behind Vision and the final call to action: the ship sails forward as you
      scroll down and backs up as you scroll up — 120 frames tied to each section's scroll progress */
   function wakeSequences() {
-    const res = innerWidth * Math.min(devicePixelRatio || 1, 2) >= 1700 ? 'x' : 'd';
+    const res = bigScreen() ? 'x' : 'd';
     const N = 120;
     const imgs = new Array(N), ok = new Uint8Array(N);
     const views = $$('canvas[data-seq="wake"]').map((cv) => ({ cv, ctx: cv.getContext('2d'), box: cv.parentElement, f: 0, drawn: -1 }));
